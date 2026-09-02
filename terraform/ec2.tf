@@ -1,39 +1,43 @@
-resource "aws_security_group" "workload" {
-  name        = "wiz-lab-workload-sg"
-  description = "Security group for Wiz managed identity lab workload"
-  vpc_id      = aws_vpc.main.id
-  ingress {
-    description = "Intentional lab exposure for attack-path demonstration"
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
+# Create EC2 using the same structure as the previous lab.
+
 resource "aws_instance" "workload" {
-  ami                         = data.aws_ssm_parameter.al2023_ami.value
-  instance_type               = "t3.micro"
-  subnet_id                   = aws_subnet.workload.id
-  vpc_security_group_ids      = [aws_security_group.workload.id]
+  ami           = data.aws_ssm_parameter.al2023.value
+  instance_type = var.instance_type
+  subnet_id     = aws_subnet.public.id
+
+  vpc_security_group_ids = [aws_security_group.ec2.id]
+  iam_instance_profile   = aws_iam_instance_profile.workload.name
+
   associate_public_ip_address = true
-  iam_instance_profile        = aws_iam_instance_profile.workload.name
-  user_data                   = <<-EOT
-#!/bin/bash
-set -eux
-dnf update -y
-dnf install -y docker awscli2
-systemctl enable --now docker
-usermod -aG docker ec2-user
-mkdir -p /opt/wiz-lab
-chown ec2-user:ec2-user /opt/wiz-lab
-echo 'Wiz managed identity lab workload initialized' > /opt/wiz-lab/README.txt
-EOT
-  tags                        = { Name = "wiz-lab-workload-ec2", Role = "workload" }
-  depends_on                  = [aws_iam_role_policy.workload_s3_read, aws_iam_role_policy_attachment.ssm, aws_iam_role_policy_attachment.ecr_read]
+
+  user_data = <<-EOF
+    #!/bin/bash
+    set -eux
+
+    dnf update -y
+    dnf install -y docker awscli2
+
+    systemctl enable docker
+    systemctl start docker
+
+    usermod -aG docker ec2-user
+
+    mkdir -p /opt/wiz-lab
+    chown ec2-user:ec2-user /opt/wiz-lab
+
+    echo "Wiz Managed Identity Lab initialized" > /tmp/wiz-lab.txt
+    echo "Workload role: wiz-lab-workload-role" > /opt/wiz-lab/README.txt
+  EOF
+
+  tags = {
+    Name        = "wiz-lab-workload"
+    Environment = "PRODUCTION-LAB"
+    Project     = var.project_name
+  }
+
+  depends_on = [
+    aws_iam_role_policy.sensitive_s3,
+    aws_iam_role_policy.ecr_pull,
+    aws_iam_role_policy_attachment.ssm
+  ]
 }
