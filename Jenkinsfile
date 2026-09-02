@@ -5,7 +5,7 @@ pipeline {
         AWS_ACCOUNT_ID = '139830186338'
         ECR_REPOSITORY = 'wiz-managed-identity-app'
         IMAGE_TAG = "${BUILD_NUMBER}"
-        WORKLOAD_INSTANCE_ID = 'REPLACE_WITH_TERRAFORM_OUTPUT'
+        WORKLOAD_INSTANCE_ID = 'i-070eab68228c7a9ac'
     }
     stages {
         stage('Checkout') { steps { checkout scm } }
