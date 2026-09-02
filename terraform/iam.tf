@@ -149,7 +149,8 @@ data "aws_iam_policy_document" "jenkins" {
       "ecr:CompleteLayerUpload",
       "ecr:InitiateLayerUpload",
       "ecr:PutImage",
-      "ecr:UploadLayerPart"
+      "ecr:UploadLayerPart",
+      "ecr:BatchGetImage"
     ]
 
     resources = [aws_ecr_repository.app.arn]
