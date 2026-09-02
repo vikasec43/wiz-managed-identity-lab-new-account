@@ -65,85 +65,71 @@ pipeline {
                     powershell '''
                     $ErrorActionPreference = "Stop"
 
-                    # -------------------------------------------------
-                    # Build ECR variables
-                    # -------------------------------------------------
-
+                    # AWS variables
                     $region = $env:AWS_REGION
                     $accountId = $env:AWS_ACCOUNT_ID
                     $repository = $env:ECR_REPOSITORY
                     $tag = $env:IMAGE_TAG
                     $instanceId = $env:WORKLOAD_INSTANCE_ID
 
+                    # Build ECR registry and image
                     $registry = "${accountId}.dkr.ecr.${region}.amazonaws.com"
                     $image = "${registry}/${repository}:${tag}"
 
                     Write-Host ""
                     Write-Host "========================================"
-                    Write-Host "Deployment Information"
+                    Write-Host "Wiz Managed Identity Lab Deployment"
                     Write-Host "========================================"
-                    Write-Host "AWS Region       : $region"
-                    Write-Host "ECR Repository   : $repository"
-                    Write-Host "Image Tag        : $tag"
-                    Write-Host "Workload EC2     : $instanceId"
-                    Write-Host "ECR Image        : $image"
+                    Write-Host "AWS Region     : $region"
+                    Write-Host "ECR Repository : $repository"
+                    Write-Host "Image Tag      : $tag"
+                    Write-Host "EC2 Instance   : $instanceId"
+                    Write-Host "ECR Image      : $image"
                     Write-Host "========================================"
                     Write-Host ""
 
-                    # -------------------------------------------------
-                    # Verify Jenkins AWS identity
-                    # -------------------------------------------------
-
-                    Write-Host "Verifying Jenkins AWS credentials..."
+                    # Verify Jenkins AWS credentials
+                    Write-Host "Checking AWS identity..."
 
                     aws sts get-caller-identity --region $region
 
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Unable to verify Jenkins AWS credentials."
+                        throw "AWS credential verification failed."
                     }
 
-                    # -------------------------------------------------
-                    # Create commands that will execute ON EC2
-                    # -------------------------------------------------
-
+                    # Commands that will execute on the EC2 instance
                     $commands = @(
                         "set -e",
-                        "echo 'Starting Wiz Managed Identity application deployment...'",
-                        "echo 'Logging in to Amazon ECR...'",
+                        "echo 'Starting application deployment...'",
+                        "echo 'Logging in to ECR...'",
                         "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}",
                         "echo 'Pulling image ${image}...'",
                         "docker pull ${image}",
-                        "echo 'Removing existing container if present...'",
+                        "echo 'Removing old container if it exists...'",
                         "docker rm -f wiz-lab-app || true",
-                        "echo 'Starting new application container...'",
+                        "echo 'Starting new container...'",
                         "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=wiz-managed-identity-lab-sensitive-139830186338 ${image}",
-                        "echo 'Checking running container...'",
+                        "echo 'Checking container...'",
                         "docker ps --filter name=wiz-lab-app",
-                        "echo 'Deployment completed on EC2.'"
+                        "echo 'Deployment completed successfully.'"
                     )
 
-                    # -------------------------------------------------
-                    # Create SSM parameter JSON
-                    # -------------------------------------------------
-
+                    # Create SSM parameters JSON
                     $parameters = @{
                         commands = $commands
                     }
 
-                    $parameters | ConvertTo-Json -Compress | Set-Content `
-                        -Path "ssm-parameters.json" `
-                        -Encoding ascii
+                    $parameters |
+                        ConvertTo-Json -Compress |
+                        Set-Content -Path "ssm-parameters.json" -Encoding ascii
 
                     Write-Host ""
-                    Write-Host "SSM parameter file:"
+                    Write-Host "SSM parameters:"
                     Get-Content "ssm-parameters.json"
                     Write-Host ""
 
-                    # -------------------------------------------------
-                    # Send command to EC2 through SSM
-                    # -------------------------------------------------
-
-                    Write-Host "Sending deployment command to EC2..."
+                    # Send command to EC2
+                    Write-Host "Sending command to EC2 through SSM..."
 
                     $commandJson = aws ssm send-command `
                         --region $region `
@@ -168,11 +154,8 @@ pipeline {
                     Write-Host "SSM Command ID: $commandId"
                     Write-Host ""
 
-                    # -------------------------------------------------
-                    # Wait for SSM command to finish
-                    # -------------------------------------------------
-
-                    Write-Host "Waiting for EC2 deployment to complete..."
+                    # Wait for SSM command
+                    Write-Host "Waiting for EC2 deployment..."
 
                     $status = "Pending"
                     $result = $null
@@ -205,14 +188,11 @@ pipeline {
                             }
                         }
                         else {
-                            Write-Host "SSM command is still being initialized..."
+                            Write-Host "Waiting for SSM command to initialize..."
                         }
                     }
 
-                    # -------------------------------------------------
-                    # Display SSM results
-                    # -------------------------------------------------
-
+                    # Display result
                     Write-Host ""
                     Write-Host "========================================"
                     Write-Host "SSM DEPLOYMENT RESULT"
@@ -238,10 +218,7 @@ pipeline {
                     Write-Host "========================================"
                     Write-Host ""
 
-                    # -------------------------------------------------
-                    # Fail Jenkins if deployment failed
-                    # -------------------------------------------------
-
+                    # Fail Jenkins if SSM failed
                     if ($status -ne "Success") {
                         throw "EC2 deployment failed. SSM final status: $status"
                     }
@@ -251,25 +228,6 @@ pipeline {
                     Write-Host "========================================"
                 }
             }
-        }
-    }
-
-    post {
-        always {
-            powershell '''
-            if (Test-Path "ssm-parameters.json") {
-                Remove-Item "ssm-parameters.json" -Force
-                Write-Host "Temporary SSM parameter file removed."
-            }
-            '''
-        }
-
-        success {
-            echo 'Wiz Managed Identity Lab deployment completed successfully.'
-        }
-
-        failure {
-            echo 'Wiz Managed Identity Lab deployment failed. Check the stage output above.'
         }
     }
 }
