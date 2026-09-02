@@ -20,11 +20,13 @@ resource "aws_s3_object" "customer_records" {
   bucket                 = aws_s3_bucket.sensitive.id
   key                    = "production/customer-records.txt"
   content                = <<-EOT
-CONFIDENTIAL - WIZ MANAGED IDENTITY LAB
-Customer ID: CUST-1001
-Name: Demo Customer
-Account Type: Production
-Data Classification: CONFIDENTIAL
+DATA_CLASSIFICATION=CONFIDENTIAL
+ENVIRONMENT=PRODUCTION-LAB
+CUSTOMER_ID=LAB-001
+CUSTOMER_NAME=Demo Customer
+ACCOUNT_NUMBER=DEMO-123456
+EMAIL=demo@example.invalid
+PHONE=0000000000
 This is synthetic demonstration data. It is not real customer information.
 EOT
   server_side_encryption = "AES256"
