@@ -42,7 +42,7 @@ data "aws_iam_policy_document" "jenkins" {
   statement {
     sid       = "EcrRepositoryPush"
     effect    = "Allow"
-    actions   = ["ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart"]
+    actions   = ["ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart", "ecr:BatchGetImage"]
     resources = [aws_ecr_repository.workload.arn]
   }
   statement {
