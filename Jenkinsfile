@@ -1,4 +1,5 @@
 pipeline {
+
     agent any
 
     environment {
@@ -19,7 +20,9 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                bat "docker build -t %ECR_REPOSITORY%:%IMAGE_TAG% app"
+                bat '''
+                    docker build -t %ECR_REPOSITORY%:%IMAGE_TAG% app
+                '''
             }
         }
 
@@ -29,7 +32,9 @@ pipeline {
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: 'wiz-lab-jenkins-aws']
                 ]) {
-                    bat "aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com"
+                    bat '''
+                        aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com
+                    '''
                 }
             }
         }
@@ -40,15 +45,18 @@ pipeline {
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: 'wiz-lab-jenkins-aws']
                 ]) {
-                    bat "docker tag %ECR_REPOSITORY%:%IMAGE_TAG% %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%"
+                    bat '''
+                        docker tag %ECR_REPOSITORY%:%IMAGE_TAG% %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%
 
-                    bat "docker push %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%"
+                        docker push %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%
+                    '''
                 }
             }
         }
 
         stage('Deploy to EC2 through SSM') {
             steps {
+
                 withCredentials([
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: 'wiz-lab-jenkins-aws']
@@ -56,160 +64,220 @@ pipeline {
 
                     script {
 
-                        def region = env.AWS_REGION
-                        def account = env.AWS_ACCOUNT_ID
-                        def repository = env.ECR_REPOSITORY
-                        def tag = env.IMAGE_TAG
-                        def instance = env.WORKLOAD_INSTANCE_ID
+                        echo '========================================'
+                        echo 'Starting SSM Deployment'
+                        echo '========================================'
 
-                        def registry = "${account}.dkr.ecr.${region}.amazonaws.com"
-                        def image = "${registry}/${repository}:${tag}"
-
-                        echo "========================================"
-                        echo "WIZ MANAGED IDENTITY LAB"
-                        echo "Deployment Information"
-                        echo "========================================"
-                        echo "AWS Region     : ${region}"
-                        echo "AWS Account    : ${account}"
-                        echo "ECR Repository : ${repository}"
-                        echo "Image Tag      : ${tag}"
-                        echo "ECR Image      : ${image}"
-                        echo "EC2 Instance   : ${instance}"
-                        echo "========================================"
-
-                        echo "Checking Jenkins AWS identity..."
-
-                        bat "aws sts get-caller-identity --region ${region}"
-
-                        echo "Checking SSM managed instance..."
-
-                        bat "aws ssm describe-instance-information --region ${region}"
+                        echo "AWS Region     : ${env.AWS_REGION}"
+                        echo "AWS Account    : ${env.AWS_ACCOUNT_ID}"
+                        echo "ECR Repository : ${env.ECR_REPOSITORY}"
+                        echo "Image Tag      : ${env.IMAGE_TAG}"
+                        echo "EC2 Instance   : ${env.WORKLOAD_INSTANCE_ID}"
 
                         /*
-                         * Commands executed ON the EC2 instance
+                         * Verify Jenkins AWS identity
                          */
-                        def commands = [
-                            "set -e",
-                            "echo 'Starting Wiz Managed Identity application deployment'",
-                            "echo 'Logging in to Amazon ECR'",
-                            "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}",
-                            "echo 'Pulling Docker image ${image}'",
-                            "docker pull ${image}",
-                            "echo 'Removing existing wiz-lab-app container'",
-                            "docker rm -f wiz-lab-app || true",
-                            "echo 'Starting new wiz-lab-app container'",
-                            "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=wiz-managed-identity-lab-sensitive-139830186338 ${image}",
-                            "echo 'Checking container status'",
-                            "docker ps --filter name=wiz-lab-app",
-                            "echo 'Deployment completed successfully'"
-                        ]
+                        echo 'Checking AWS identity...'
+
+                        bat '''
+                            aws sts get-caller-identity
+                        '''
 
                         /*
-                         * Create SSM parameter JSON
+                         * Verify SSM instance
                          */
-                        def parameters = [
-                            commands: commands
-                        ]
+                        echo 'Checking SSM managed instance...'
 
+                        bat '''
+                            aws ssm describe-instance-information --region %AWS_REGION%
+                        '''
+
+                        /*
+                         * Create the ECR image URL
+                         */
+                        def registry = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+
+                        def image = "${registry}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+
+                        echo "Image to deploy: ${image}"
+
+                        /*
+                         * Commands executed on EC2
+                         */
+                        def ssmJson = """
+{
+    "commands": [
+        "set -e",
+        "echo Starting Wiz Managed Identity application deployment",
+        "echo Logging in to Amazon ECR",
+        "aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${registry}",
+        "echo Pulling image ${image}",
+        "docker pull ${image}",
+        "echo Removing old container if present",
+        "docker rm -f wiz-lab-app || true",
+        "echo Starting new container",
+        "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=wiz-managed-identity-lab-sensitive-139830186338 ${image}",
+        "echo Checking running container",
+        "docker ps --filter name=wiz-lab-app",
+        "echo Deployment completed successfully"
+    ]
+}
+"""
+
+                        /*
+                         * Write JSON file.
+                         */
                         writeFile(
                             file: 'ssm-parameters.json',
-                            text: groovy.json.JsonOutput.toJson(parameters)
+                            text: ssmJson.trim()
                         )
 
-                        echo "SSM parameter file created."
+                        echo 'SSM parameter file created.'
 
                         /*
-                         * Send command to EC2
+                         * Send command to EC2.
+                         *
+                         * Output is saved to a JSON file.
                          */
-                        echo "Sending deployment command through SSM..."
+                        echo 'Sending SSM command...'
 
-                        bat "aws ssm send-command --region ${region} --instance-ids ${instance} --document-name AWS-RunShellScript --comment \"Deploy Wiz managed identity application\" --parameters file://ssm-parameters.json --output json > ssm-command.json"
+                        bat """
+                            aws ssm send-command ^
+                            --region ${env.AWS_REGION} ^
+                            --instance-ids ${env.WORKLOAD_INSTANCE_ID} ^
+                            --document-name AWS-RunShellScript ^
+                            --comment "Deploy Wiz managed identity application" ^
+                            --parameters file://ssm-parameters.json ^
+                            --output json > ssm-command.json
+                        """
 
                         /*
-                         * Read CommandId using PowerShell JSON parsing
+                         * Extract CommandId using PowerShell.
+                         *
+                         * IMPORTANT:
+                         * No JsonSlurper / Groovy JSON parser is used.
                          */
                         def commandId = powershell(
-                            script: '(Get-Content ssm-command.json -Raw | ConvertFrom-Json).Command.CommandId',
+                            script: '''
+                                $json = Get-Content "ssm-command.json" -Raw | ConvertFrom-Json
+                                $json.Command.CommandId
+                            ''',
                             returnStdout: true
                         ).trim()
 
-                        if (!commandId) {
-                            error("SSM did not return a CommandId.")
+                        if (commandId == '') {
+                            error('Unable to obtain SSM CommandId.')
                         }
 
                         echo "SSM Command ID: ${commandId}"
 
                         /*
-                         * Wait for command completion
+                         * Wait for SSM command.
                          */
-                        echo "Waiting for EC2 deployment to complete..."
+                        echo 'Waiting for SSM deployment...'
 
-                        def finalStatus = "Pending"
+                        def status = 'Pending'
 
-                        for (int i = 1; i <= 36; i++) {
+                        for (int i = 0; i < 36; i++) {
 
                             sleep time: 5, unit: 'SECONDS'
 
-                            def status = powershell(
+                            status = powershell(
                                 script: """
-                                (aws ssm get-command-invocation --region ${region} --command-id ${commandId} --instance-id ${instance} --output json | ConvertFrom-Json).Status
+                                    \$result = aws ssm get-command-invocation --region ${env.AWS_REGION} --command-id ${commandId} --instance-id ${env.WORKLOAD_INSTANCE_ID} --output json | ConvertFrom-Json
+                                    \$result.Status
                                 """,
                                 returnStdout: true
                             ).trim()
 
-                            finalStatus = status
+                            echo "SSM Status: ${status}"
 
-                            echo "SSM Status: ${finalStatus}"
-
-                            if (finalStatus in [
-                                "Success",
-                                "Failed",
-                                "Cancelled",
-                                "TimedOut",
-                                "Cancelling"
-                            ]) {
+                            if (
+                                status == 'Success' ||
+                                status == 'Failed' ||
+                                status == 'Cancelled' ||
+                                status == 'TimedOut' ||
+                                status == 'Cancelling'
+                            ) {
                                 break
                             }
                         }
 
                         /*
-                         * Retrieve final SSM output
+                         * Get Standard Output.
                          */
-                        def resultJson = powershell(
+                        def standardOutput = powershell(
                             script: """
-                            aws ssm get-command-invocation --region ${region} --command-id ${commandId} --instance-id ${instance} --output json
+                                \$result = aws ssm get-command-invocation --region ${env.AWS_REGION} --command-id ${commandId} --instance-id ${env.WORKLOAD_INSTANCE_ID} --output json | ConvertFrom-Json
+                                \$result.StandardOutputContent
                             """,
                             returnStdout: true
                         ).trim()
 
-                        def result = new groovy.json.JsonSlurperClassic().parseText(resultJson)
+                        /*
+                         * Get Standard Error.
+                         */
+                        def standardError = powershell(
+                            script: """
+                                \$result = aws ssm get-command-invocation --region ${env.AWS_REGION} --command-id ${commandId} --instance-id ${env.WORKLOAD_INSTANCE_ID} --output json | ConvertFrom-Json
+                                \$result.StandardErrorContent
+                            """,
+                            returnStdout: true
+                        ).trim()
 
-                        echo "========================================"
-                        echo "SSM DEPLOYMENT RESULT"
-                        echo "========================================"
+                        /*
+                         * Display deployment result.
+                         */
+                        echo '========================================'
+                        echo 'SSM DEPLOYMENT RESULT'
+                        echo '========================================'
 
                         echo "Command ID : ${commandId}"
-                        echo "Status     : ${result.Status}"
-                        echo "Response   : ${result.ResponseCode}"
+                        echo "Status     : ${status}"
 
-                        echo "----- Standard Output -----"
-                        echo "${result.StandardOutputContent}"
+                        echo '----- Standard Output -----'
 
-                        echo "----- Standard Error -----"
-                        echo "${result.StandardErrorContent}"
-
-                        echo "========================================"
-
-                        if (result.Status != "Success") {
-                            error("EC2 deployment failed. SSM status: ${result.Status}")
+                        if (standardOutput != '') {
+                            echo standardOutput
+                        } else {
+                            echo 'No standard output returned.'
                         }
 
-                        echo "========================================"
-                        echo "DEPLOYMENT SUCCESSFUL"
-                        echo "========================================"
+                        echo '----- Standard Error -----'
+
+                        if (standardError != '') {
+                            echo standardError
+                        } else {
+                            echo 'No standard error returned.'
+                        }
+
+                        echo '========================================'
+
+                        /*
+                         * Fail Jenkins only if EC2 deployment actually failed.
+                         */
+                        if (status != 'Success') {
+                            error("SSM deployment failed. Final status: ${status}")
+                        }
+
+                        echo '========================================'
+                        echo 'DEPLOYMENT SUCCESSFUL'
+                        echo '========================================'
                     }
                 }
             }
+        }
+    }
+
+    post {
+
+        success {
+            echo 'Wiz Managed Identity Lab pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Wiz Managed Identity Lab pipeline failed.'
+            echo 'Check the stage output above for the exact failure.'
         }
     }
 }
