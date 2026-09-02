@@ -93,157 +93,143 @@ pipeline {
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: 'wiz-lab-jenkins-aws']
                 ]) {
-                    script {
+                    powershell '''
+                        $ErrorActionPreference = "Stop"
 
-                        def registry =
-                            "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                        $region = $env:AWS_REGION
+                        $account = $env:AWS_ACCOUNT_ID
+                        $repo = $env:ECR_REPOSITORY
+                        $instance = $env:WORKLOAD_INSTANCE_ID
+                        $bucket = $env:SENSITIVE_BUCKET
+                        $tag = $env:IMAGE_TAG
 
-                        def image =
-                            "${registry}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                        $registry = "$account.dkr.ecr.$region.amazonaws.com"
+                        $image = "$registry/$repo`:$tag"
 
-                        echo "========================================"
-                        echo "Deploying Application to EC2"
-                        echo "========================================"
-                        echo "EC2 Instance : ${env.WORKLOAD_INSTANCE_ID}"
-                        echo "Docker Image : ${image}"
+                        Write-Host "========================================"
+                        Write-Host "Deploying application to EC2"
+                        Write-Host "========================================"
+                        Write-Host "AWS Account : $account"
+                        Write-Host "AWS Region  : $region"
+                        Write-Host "EC2         : $instance"
+                        Write-Host "Image       : $image"
+                        Write-Host "S3 Bucket   : $bucket"
 
-                        /*
-                         * Create SSM command parameters as JSON.
-                         *
-                         * This avoids Windows CMD quoting problems.
-                         */
-                        def ssmParameters = """
-{
-    "commands": [
-        "set -e",
-        "echo Starting deployment",
-        "aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${registry}",
-        "docker pull ${image}",
-        "docker rm -f wiz-lab-app || true",
-        "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=${env.SENSITIVE_BUCKET} ${image}",
-        "docker ps --filter name=wiz-lab-app",
-        "echo Deployment completed"
-    ]
-}
-"""
+                        Write-Host ""
+                        Write-Host "Checking AWS identity..."
+                        aws sts get-caller-identity
 
-                        writeFile(
-                            file: 'ssm-parameters.json',
-                            text: ssmParameters.trim()
+                        Write-Host ""
+                        Write-Host "Checking SSM managed instance..."
+                        aws ssm describe-instance-information --region $region
+
+                        Write-Host ""
+                        Write-Host "Creating SSM command parameters..."
+
+                        $commands = @(
+                            "set -e",
+                            "echo Starting Wiz Managed Identity application deployment",
+                            "echo Logging in to Amazon ECR",
+                            "aws ecr get-login-password --region $region | docker login --username AWS --password-stdin $registry",
+                            "echo Pulling application image",
+                            "docker pull $image",
+                            "echo Removing previous container",
+                            "docker rm -f wiz-lab-app || true",
+                            "echo Starting application container",
+                            "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=$bucket $image",
+                            "echo Checking container",
+                            "docker ps --filter name=wiz-lab-app",
+                            "echo Deployment completed successfully"
                         )
 
-                        echo "SSM parameter file created."
+                        $parameters = @{
+                            commands = $commands
+                        } | ConvertTo-Json -Compress
 
-                        /*
-                         * Send command to EC2 through SSM.
-                         */
-                        bat """
-                            aws ssm send-command ^
-                            --region ${env.AWS_REGION} ^
-                            --instance-ids ${env.WORKLOAD_INSTANCE_ID} ^
-                            --document-name AWS-RunShellScript ^
-                            --comment "Deploy Wiz Managed Identity Lab" ^
-                            --parameters file://ssm-parameters.json ^
-                            --output json > ssm-command.json
-                        """
+                        Write-Host "Sending SSM command..."
 
-                        /*
-                         * Extract SSM Command ID.
-                         */
-                        def commandId = powershell(
-                            script: '''
-                                $json = Get-Content "ssm-command.json" -Raw | ConvertFrom-Json
-                                $json.Command.CommandId
-                            ''',
-                            returnStdout: true
-                        ).trim()
+                        $result = aws ssm send-command `
+                            --region $region `
+                            --instance-ids $instance `
+                            --document-name "AWS-RunShellScript" `
+                            --comment "Deploy Wiz Managed Identity Lab application" `
+                            --parameters $parameters `
+                            --output json | ConvertFrom-Json
 
-                        if (!commandId) {
-                            error("Unable to obtain SSM Command ID.")
+                        $commandId = $result.Command.CommandId
+
+                        if ([string]::IsNullOrWhiteSpace($commandId)) {
+                            throw "SSM Command ID was not returned."
                         }
 
-                        echo "SSM Command ID: ${commandId}"
+                        Write-Host ""
+                        Write-Host "SSM Command ID: $commandId"
+                        Write-Host "Waiting for deployment..."
 
-                        /*
-                         * Wait for SSM command to complete.
-                         */
-                        def status = "Pending"
+                        $status = "Pending"
 
-                        for (int i = 0; i < 36; i++) {
+                        for ($i = 1; $i -le 36; $i++) {
 
-                            sleep(
-                                time: 5,
-                                unit: 'SECONDS'
-                            )
+                            Start-Sleep -Seconds 5
 
-                            status = powershell(
-                                script: """
-                                    \$result = aws ssm get-command-invocation --region ${env.AWS_REGION} --command-id ${commandId} --instance-id ${env.WORKLOAD_INSTANCE_ID} --output json | ConvertFrom-Json
-                                    \$result.Status
-                                """,
-                                returnStdout: true
-                            ).trim()
+                            $invocation = aws ssm get-command-invocation `
+                                --region $region `
+                                --command-id $commandId `
+                                --instance-id $instance `
+                                --output json | ConvertFrom-Json
 
-                            echo "SSM Status: ${status}"
+                            $status = $invocation.Status
+
+                            Write-Host "SSM Status: $status"
 
                             if (
-                                status == "Success" ||
-                                status == "Failed" ||
-                                status == "Cancelled" ||
-                                status == "TimedOut"
+                                $status -eq "Success" -or
+                                $status -eq "Failed" -or
+                                $status -eq "Cancelled" -or
+                                $status -eq "TimedOut"
                             ) {
                                 break
                             }
                         }
 
-                        /*
-                         * Get SSM command output.
-                         */
-                        def output = powershell(
-                            script: """
-                                \$result = aws ssm get-command-invocation --region ${env.AWS_REGION} --command-id ${commandId} --instance-id ${env.WORKLOAD_INSTANCE_ID} --output json | ConvertFrom-Json
-                                \$result.StandardOutputContent
-                            """,
-                            returnStdout: true
-                        ).trim()
+                        Write-Host ""
+                        Write-Host "========================================"
+                        Write-Host "SSM DEPLOYMENT RESULT"
+                        Write-Host "========================================"
 
-                        def errorOutput = powershell(
-                            script: """
-                                \$result = aws ssm get-command-invocation --region ${env.AWS_REGION} --command-id ${commandId} --instance-id ${env.WORKLOAD_INSTANCE_ID} --output json | ConvertFrom-Json
-                                \$result.StandardErrorContent
-                            """,
-                            returnStdout: true
-                        ).trim()
+                        Write-Host "Command ID: $commandId"
+                        Write-Host "Status: $status"
 
-                        echo "========================================"
-                        echo "SSM DEPLOYMENT RESULT"
-                        echo "========================================"
+                        $final = aws ssm get-command-invocation `
+                            --region $region `
+                            --command-id $commandId `
+                            --instance-id $instance `
+                            --output json | ConvertFrom-Json
 
-                        echo "Command ID : ${commandId}"
-                        echo "Status     : ${status}"
+                        Write-Host ""
+                        Write-Host "----- Standard Output -----"
 
-                        echo "---------- Standard Output ----------"
-
-                        if (output) {
-                            echo output
+                        if ($final.StandardOutputContent) {
+                            Write-Host $final.StandardOutputContent
                         }
 
-                        echo "---------- Standard Error ----------"
+                        Write-Host ""
+                        Write-Host "----- Standard Error -----"
 
-                        if (errorOutput) {
-                            echo errorOutput
+                        if ($final.StandardErrorContent) {
+                            Write-Host $final.StandardErrorContent
                         }
 
-                        echo "========================================"
+                        Write-Host ""
+                        Write-Host "========================================"
 
-                        if (status != "Success") {
-                            error(
-                                "EC2 deployment failed. SSM status: ${status}"
-                            )
+                        if ($status -ne "Success") {
+                            throw "SSM deployment failed with status: $status"
                         }
 
-                        echo "EC2 deployment completed successfully."
-                    }
+                        Write-Host "DEPLOYMENT SUCCESSFUL"
+                        Write-Host "========================================"
+                    '''
                 }
             }
         }
