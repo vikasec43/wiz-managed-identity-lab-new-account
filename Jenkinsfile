@@ -2,13 +2,13 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION           = 'us-east-1'
-        AWS_ACCOUNT_ID       = '139830186338'
-        ECR_REPOSITORY       = 'wiz-managed-identity-app'
-        IMAGE_TAG            = "${BUILD_NUMBER}"
-        WORKLOAD_INSTANCE_ID = 'i-02e8dd862397203ad'
-        SENSITIVE_BUCKET     = 'wiz-managed-identity-lab-sensitive-139830186338'
-        JENKINS_AWS_CREDENTIAL = 'wiz-lab-jenkins-aws'
+        AWS_REGION              = 'us-east-1'
+        AWS_ACCOUNT_ID          = '139830186338'
+        ECR_REPOSITORY          = 'wiz-managed-identity-app'
+        IMAGE_TAG               = "${BUILD_NUMBER}"
+        WORKLOAD_INSTANCE_ID    = 'i-02e8dd862397203ad'
+        SENSITIVE_BUCKET        = 'wiz-managed-identity-lab-sensitive-139830186338'
+        JENKINS_AWS_CREDENTIAL  = 'wiz-lab-jenkins-aws'
     }
 
     stages {
@@ -31,6 +31,8 @@ pipeline {
                         echo ========================================
 
                         aws sts get-caller-identity
+
+                        if %ERRORLEVEL% NEQ 0 exit /b 1
                     '''
                 }
             }
@@ -43,7 +45,11 @@ pipeline {
                     echo BUILDING DOCKER IMAGE
                     echo ========================================
 
-                    docker build -t %ECR_REPOSITORY%:%IMAGE_TAG% app
+                    docker build ^
+                        -t %ECR_REPOSITORY%:%IMAGE_TAG% ^
+                        app
+
+                    if %ERRORLEVEL% NEQ 0 exit /b 1
                 '''
             }
         }
@@ -59,7 +65,14 @@ pipeline {
                         echo AUTHENTICATING TO ECR
                         echo ========================================
 
-                        aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com
+                        aws ecr get-login-password ^
+                            --region %AWS_REGION% ^
+                            | docker login ^
+                            --username AWS ^
+                            --password-stdin ^
+                            %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com
+
+                        if %ERRORLEVEL% NEQ 0 exit /b 1
                     '''
                 }
             }
@@ -73,12 +86,23 @@ pipeline {
                 ]) {
                     bat '''
                         echo ========================================
+                        echo TAGGING IMAGE
+                        echo ========================================
+
+                        docker tag ^
+                            %ECR_REPOSITORY%:%IMAGE_TAG% ^
+                            %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%
+
+                        if %ERRORLEVEL% NEQ 0 exit /b 1
+
+                        echo ========================================
                         echo PUSHING IMAGE TO ECR
                         echo ========================================
 
-                        docker tag %ECR_REPOSITORY%:%IMAGE_TAG% %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%
+                        docker push ^
+                            %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%
 
-                        docker push %AWS_ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com/%ECR_REPOSITORY%:%IMAGE_TAG%
+                        if %ERRORLEVEL% NEQ 0 exit /b 1
                     '''
                 }
             }
@@ -86,7 +110,6 @@ pipeline {
 
         stage('Deploy to EC2 through SSM') {
             steps {
-
                 withCredentials([
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: "${JENKINS_AWS_CREDENTIAL}"]
@@ -109,53 +132,33 @@ pipeline {
                         echo "========================================"
 
                         /*
-                         * Commands executed on Amazon Linux EC2.
+                         * Commands executed on EC2.
                          *
-                         * SSM runs these commands as root.
-                         *
-                         * Docker is installed automatically if it
-                         * is not already installed.
+                         * EC2 is Amazon Linux.
+                         * SSM executes the commands as root.
                          */
 
                         def commands = [
                             "set -e",
-                            "echo 'Starting EC2 deployment'",
-                            "echo 'Checking operating system'",
-                            "cat /etc/os-release",
-                            "echo 'Checking Docker installation'",
-                            "if ! command -v docker >/dev/null 2>&1; then echo 'Docker not found - installing Docker'; dnf install -y docker; fi",
-                            "echo 'Enabling Docker service'",
+                            "echo Starting deployment",
+                            "echo Checking Docker",
+                            "if ! command -v docker >/dev/null 2>&1; then dnf install -y docker; fi",
                             "systemctl enable docker",
-                            "echo 'Starting Docker service'",
                             "systemctl start docker",
-                            "echo 'Checking Docker status'",
-                            "systemctl is-active docker",
                             "docker --version",
-                            "echo 'Checking AWS CLI'",
-                            "aws --version",
-                            "echo 'Logging in to Amazon ECR'",
+                            "echo Logging into ECR",
                             "aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${registry}",
-                            "echo 'Pulling Docker image'",
+                            "echo Pulling image",
                             "docker pull ${image}",
-                            "echo 'Removing previous application container'",
+                            "echo Removing previous container",
                             "docker rm -f wiz-lab-app || true",
-                            "echo 'Starting application container'",
+                            "echo Starting application",
                             "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=${env.SENSITIVE_BUCKET} ${image}",
-                            "echo 'Waiting for container to start'",
                             "sleep 5",
-                            "echo 'Checking running containers'",
+                            "echo Checking container",
                             "docker ps --filter name=wiz-lab-app",
-                            "echo 'Checking application container logs'",
-                            "docker logs --tail 50 wiz-lab-app",
-                            "echo 'Deployment completed successfully'"
+                            "echo Deployment completed successfully"
                         ]
-
-                        /*
-                         * Convert commands into JSON.
-                         *
-                         * JsonOutput.toJson is used so that the JSON
-                         * is correctly escaped.
-                         */
 
                         def jsonCommands =
                             groovy.json.JsonOutput.toJson([
@@ -170,96 +173,130 @@ pipeline {
                         echo "SSM parameter file created."
 
                         /*
-                         * Send command to EC2.
+                         * Send SSM command.
+                         *
+                         * IMPORTANT:
+                         * We only extract CommandId.
+                         * We do NOT pipe the complete response
+                         * through ConvertFrom-Json in the polling loop.
                          */
 
-                        powershell """
-                            \$ErrorActionPreference = 'Stop'
+                        powershell(
+                            script: """
+                                \$ErrorActionPreference = 'Stop'
 
-                            Write-Host 'Sending SSM command...'
-
-                            \$result = aws ssm send-command `
-                                --region '${env.AWS_REGION}' `
-                                --instance-ids '${env.WORKLOAD_INSTANCE_ID}' `
-                                --document-name 'AWS-RunShellScript' `
-                                --comment 'Deploy Wiz Managed Identity Lab application' `
-                                --parameters file://ssm-parameters.json `
-                                --output json
-
-                            \$result | Out-File -FilePath 'ssm-command.json' -Encoding utf8
-
-                            \$commandId = (\$result | ConvertFrom-Json).Command.CommandId
-
-                            if ([string]::IsNullOrWhiteSpace(\$commandId)) {
-                                throw 'SSM Command ID was not returned.'
-                            }
-
-                            Write-Host "SSM Command ID: \$commandId"
-
-                            \$status = 'Pending'
-
-                            for (\$i = 1; \$i -le 60; \$i++) {
-
-                                Start-Sleep -Seconds 5
-
-                                \$invocation = aws ssm get-command-invocation `
+                                \$response = aws ssm send-command `
                                     --region '${env.AWS_REGION}' `
-                                    --command-id \$commandId `
-                                    --instance-id '${env.WORKLOAD_INSTANCE_ID}' `
-                                    --output json | ConvertFrom-Json
+                                    --instance-ids '${env.WORKLOAD_INSTANCE_ID}' `
+                                    --document-name 'AWS-RunShellScript' `
+                                    --comment 'Deploy Wiz Managed Identity Lab application' `
+                                    --parameters file://ssm-parameters.json `
+                                    --query 'Command.CommandId' `
+                                    --output text
 
-                                \$status = \$invocation.Status
-
-                                Write-Host "SSM Status: \$status"
-
-                                if (
-                                    \$status -eq 'Success' -or
-                                    \$status -eq 'Failed' -or
-                                    \$status -eq 'Cancelled' -or
-                                    \$status -eq 'TimedOut'
-                                ) {
-                                    break
+                                if (\$LASTEXITCODE -ne 0) {
+                                    throw 'Failed to send SSM command.'
                                 }
-                            }
 
-                            Write-Host ''
-                            Write-Host '========================================'
-                            Write-Host 'SSM DEPLOYMENT RESULT'
-                            Write-Host '========================================'
+                                \$response = \$response.Trim()
 
-                            Write-Host "Command ID : \$commandId"
-                            Write-Host "Status     : \$status"
+                                if ([string]::IsNullOrWhiteSpace(\$response)) {
+                                    throw 'SSM Command ID was not returned.'
+                                }
 
-                            \$final = aws ssm get-command-invocation `
-                                --region '${env.AWS_REGION}' `
-                                --command-id \$commandId `
-                                --instance-id '${env.WORKLOAD_INSTANCE_ID}' `
-                                --output json | ConvertFrom-Json
+                                Set-Content `
+                                    -Path 'ssm-command-id.txt' `
+                                    -Value \$response `
+                                    -Encoding ascii
 
-                            Write-Host ''
-                            Write-Host '---------- STANDARD OUTPUT ----------'
+                                Write-Host "SSM Command ID: \$response"
+                            """
+                        )
 
-                            if (\$final.StandardOutputContent) {
-                                Write-Host \$final.StandardOutputContent
-                            }
+                        def commandId = readFile(
+                            file: 'ssm-command-id.txt'
+                        ).trim()
 
-                            Write-Host ''
-                            Write-Host '---------- STANDARD ERROR ----------'
+                        echo "SSM Command ID: ${commandId}"
 
-                            if (\$final.StandardErrorContent) {
-                                Write-Host \$final.StandardErrorContent
-                            }
+                        /*
+                         * Wait for SSM execution.
+                         *
+                         * AWS CLI waiter handles polling.
+                         * No JSON parsing is required here.
+                         */
 
-                            Write-Host ''
-                            Write-Host '========================================'
+                        powershell(
+                            script: """
+                                \$ErrorActionPreference = 'Stop'
 
-                            if (\$status -ne 'Success') {
-                                throw "EC2 deployment failed. SSM status: \$status"
-                            }
+                                Write-Host 'Waiting for SSM command to complete...'
 
-                            Write-Host 'DEPLOYMENT SUCCESSFUL'
-                            Write-Host '========================================'
-                        """
+                                aws ssm wait command-executed `
+                                    --region '${env.AWS_REGION}' `
+                                    --command-id '${commandId}' `
+                                    --instance-id '${env.WORKLOAD_INSTANCE_ID}'
+
+                                if (\$LASTEXITCODE -ne 0) {
+                                    throw 'SSM command did not complete successfully.'
+                                }
+
+                                Write-Host 'SSM command completed successfully.'
+                            """
+                        )
+
+                        /*
+                         * Get final status.
+                         *
+                         * Use --query to return only the status.
+                         */
+
+                        def finalStatus = powershell(
+                            script: """
+                                \$ErrorActionPreference = 'Stop'
+
+                                aws ssm get-command-invocation `
+                                    --region '${env.AWS_REGION}' `
+                                    --command-id '${commandId}' `
+                                    --instance-id '${env.WORKLOAD_INSTANCE_ID}' `
+                                    --query 'Status' `
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Final SSM Status: ${finalStatus}"
+
+                        if (finalStatus != 'Success') {
+                            error(
+                                "EC2 deployment failed. SSM status: ${finalStatus}"
+                            )
+                        }
+
+                        /*
+                         * Retrieve standard output separately.
+                         *
+                         * --output text prevents JSON parsing.
+                         */
+
+                        echo "========================================"
+                        echo "SSM DEPLOYMENT OUTPUT"
+                        echo "========================================"
+
+                        powershell(
+                            script: """
+                                aws ssm get-command-invocation `
+                                    --region '${env.AWS_REGION}' `
+                                    --command-id '${commandId}' `
+                                    --instance-id '${env.WORKLOAD_INSTANCE_ID}' `
+                                    --query 'StandardOutputContent' `
+                                    --output text
+                            """
+                        )
+
+                        echo "========================================"
+                        echo "EC2 DEPLOYMENT SUCCESSFUL"
+                        echo "========================================"
                     }
                 }
             }
@@ -267,7 +304,6 @@ pipeline {
 
         stage('Verify Deployment') {
             steps {
-
                 withCredentials([
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: "${JENKINS_AWS_CREDENTIAL}"]
@@ -277,14 +313,19 @@ pipeline {
                         \$ErrorActionPreference = 'Stop'
 
                         Write-Host '========================================'
-                        Write-Host 'VERIFYING EC2'
+                        Write-Host 'VERIFYING EC2 SSM STATUS'
                         Write-Host '========================================'
 
                         aws ssm describe-instance-information `
-                            --region '${env.AWS_REGION}'
+                            --region '${env.AWS_REGION}' `
+                            --query 'InstanceInformationList[?InstanceId==\\`${env.WORKLOAD_INSTANCE_ID}\\`].[InstanceId,PingStatus,PlatformName]' `
+                            --output table
+
+                        if (\$LASTEXITCODE -ne 0) {
+                            throw 'Unable to verify EC2 SSM status.'
+                        }
 
                         Write-Host ''
-                        Write-Host 'EC2 instance is registered with SSM.'
                         Write-Host 'Deployment verification completed.'
                     """
                 }
@@ -309,7 +350,8 @@ DEPLOYMENT SUCCESSFUL
 WIZ MANAGED IDENTITY LAB
 DEPLOYMENT FAILED
 ========================================
-Check the failed stage in Console Output.
+Review the failed stage in Console Output.
+========================================
 '''
         }
     }
