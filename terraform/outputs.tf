@@ -1,0 +1,10 @@
+output "account_id" { value = data.aws_caller_identity.current.account_id }
+output "region" { value = var.aws_region }
+output "sensitive_bucket_name" { value = aws_s3_bucket.sensitive.bucket }
+output "sensitive_object_arn" { value = "${aws_s3_bucket.sensitive.arn}/production/customer-records.txt" }
+output "workload_role_arn" { value = aws_iam_role.workload.arn }
+output "workload_instance_id" { value = aws_instance.workload.id }
+output "workload_public_ip" { value = aws_instance.workload.public_ip }
+output "ecr_repository_url" { value = aws_ecr_repository.workload.repository_url }
+output "engineer_user_arn" { value = aws_iam_user.engineer.arn }
+output "jenkins_user_arn" { value = aws_iam_user.jenkins.arn }
