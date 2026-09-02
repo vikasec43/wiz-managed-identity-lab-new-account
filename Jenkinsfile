@@ -55,6 +55,7 @@ pipeline {
                 ]) {
 
                     script {
+
                         def region = env.AWS_REGION
                         def account = env.AWS_ACCOUNT_ID
                         def repository = env.ECR_REPOSITORY
@@ -65,85 +66,142 @@ pipeline {
                         def image = "${registry}/${repository}:${tag}"
 
                         echo "========================================"
+                        echo "WIZ MANAGED IDENTITY LAB"
                         echo "Deployment Information"
                         echo "========================================"
-                        echo "Region   : ${region}"
-                        echo "Account  : ${account}"
-                        echo "Image    : ${image}"
-                        echo "Instance : ${instance}"
+                        echo "AWS Region     : ${region}"
+                        echo "AWS Account    : ${account}"
+                        echo "ECR Repository : ${repository}"
+                        echo "Image Tag      : ${tag}"
+                        echo "ECR Image      : ${image}"
+                        echo "EC2 Instance   : ${instance}"
                         echo "========================================"
+
+                        echo "Checking Jenkins AWS identity..."
 
                         bat "aws sts get-caller-identity --region ${region}"
 
+                        echo "Checking SSM managed instance..."
+
                         bat "aws ssm describe-instance-information --region ${region}"
+
+                        /*
+                         * Commands executed ON the EC2 instance
+                         */
+                        def commands = [
+                            "set -e",
+                            "echo 'Starting Wiz Managed Identity application deployment'",
+                            "echo 'Logging in to Amazon ECR'",
+                            "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}",
+                            "echo 'Pulling Docker image ${image}'",
+                            "docker pull ${image}",
+                            "echo 'Removing existing wiz-lab-app container'",
+                            "docker rm -f wiz-lab-app || true",
+                            "echo 'Starting new wiz-lab-app container'",
+                            "docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=wiz-managed-identity-lab-sensitive-139830186338 ${image}",
+                            "echo 'Checking container status'",
+                            "docker ps --filter name=wiz-lab-app",
+                            "echo 'Deployment completed successfully'"
+                        ]
+
+                        /*
+                         * Create SSM parameter JSON
+                         */
+                        def parameters = [
+                            commands: commands
+                        ]
 
                         writeFile(
                             file: 'ssm-parameters.json',
-                            text: """{"commands":["set -e","echo Starting deployment","aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}","docker pull ${image}","docker rm -f wiz-lab-app || true","docker run -d --restart unless-stopped --name wiz-lab-app -p 8080:8080 -e SENSITIVE_BUCKET=wiz-managed-identity-lab-sensitive-139830186338 ${image}","docker ps --filter name=wiz-lab-app","echo Deployment completed"]}"""
+                            text: groovy.json.JsonOutput.toJson(parameters)
                         )
 
+                        echo "SSM parameter file created."
+
+                        /*
+                         * Send command to EC2
+                         */
                         echo "Sending deployment command through SSM..."
 
                         bat "aws ssm send-command --region ${region} --instance-ids ${instance} --document-name AWS-RunShellScript --comment \"Deploy Wiz managed identity application\" --parameters file://ssm-parameters.json --output json > ssm-command.json"
 
-                        def commandId = bat(
-                            script: '@for /f "tokens=2 delims=:, " %A in (\'findstr /C:"CommandId" ssm-command.json\') do @echo %A',
+                        /*
+                         * Read CommandId using PowerShell JSON parsing
+                         */
+                        def commandId = powershell(
+                            script: '(Get-Content ssm-command.json -Raw | ConvertFrom-Json).Command.CommandId',
                             returnStdout: true
                         ).trim()
 
-                        commandId = commandId.replace('"', '')
-
                         if (!commandId) {
-                            error("Could not obtain SSM Command ID.")
+                            error("SSM did not return a CommandId.")
                         }
 
                         echo "SSM Command ID: ${commandId}"
 
-                        echo "Waiting for SSM deployment..."
+                        /*
+                         * Wait for command completion
+                         */
+                        echo "Waiting for EC2 deployment to complete..."
 
-                        bat "timeout /t 10 /nobreak"
+                        def finalStatus = "Pending"
 
-                        def status = "InProgress"
+                        for (int i = 1; i <= 36; i++) {
 
-                        for (int i = 1; i <= 30; i++) {
+                            sleep time: 5, unit: 'SECONDS'
 
-                            bat "aws ssm get-command-invocation --region ${region} --command-id ${commandId} --instance-id ${instance} --output json > ssm-result.json"
+                            def status = powershell(
+                                script: """
+                                (aws ssm get-command-invocation --region ${region} --command-id ${commandId} --instance-id ${instance} --output json | ConvertFrom-Json).Status
+                                """,
+                                returnStdout: true
+                            ).trim()
 
-                            def resultText = readFile('ssm-result.json')
+                            finalStatus = status
 
-                            echo "SSM response received."
+                            echo "SSM Status: ${finalStatus}"
 
-                            if (resultText.contains('"Status": "Success"')) {
-                                status = "Success"
+                            if (finalStatus in [
+                                "Success",
+                                "Failed",
+                                "Cancelled",
+                                "TimedOut",
+                                "Cancelling"
+                            ]) {
                                 break
                             }
-
-                            if (resultText.contains('"Status": "Failed"')) {
-                                status = "Failed"
-                                break
-                            }
-
-                            if (resultText.contains('"Status": "Cancelled"')) {
-                                status = "Cancelled"
-                                break
-                            }
-
-                            if (resultText.contains('"Status": "TimedOut"')) {
-                                status = "TimedOut"
-                                break
-                            }
-
-                            bat "timeout /t 5 /nobreak"
                         }
 
+                        /*
+                         * Retrieve final SSM output
+                         */
+                        def resultJson = powershell(
+                            script: """
+                            aws ssm get-command-invocation --region ${region} --command-id ${commandId} --instance-id ${instance} --output json
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        def result = new groovy.json.JsonSlurperClassic().parseText(resultJson)
+
                         echo "========================================"
-                        echo "Final SSM Status: ${status}"
+                        echo "SSM DEPLOYMENT RESULT"
                         echo "========================================"
 
-                        echo readFile('ssm-result.json')
+                        echo "Command ID : ${commandId}"
+                        echo "Status     : ${result.Status}"
+                        echo "Response   : ${result.ResponseCode}"
 
-                        if (status != "Success") {
-                            error("SSM deployment failed. Final status: ${status}")
+                        echo "----- Standard Output -----"
+                        echo "${result.StandardOutputContent}"
+
+                        echo "----- Standard Error -----"
+                        echo "${result.StandardErrorContent}"
+
+                        echo "========================================"
+
+                        if (result.Status != "Success") {
+                            error("EC2 deployment failed. SSM status: ${result.Status}")
                         }
 
                         echo "========================================"
